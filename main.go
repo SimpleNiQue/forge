@@ -329,8 +329,33 @@ func syncCache(templateName string, repoName string, token string, verbose bool)
 
 	meta := loadMeta(templateName)
 	cDir := cacheDir(templateName)
-	updated, added := 0, 0
+	updated, added, removed := 0, 0, 0
 
+	// Build a set of remote paths for fast lookup
+	remotePaths := make(map[string]struct{}, len(tree))
+	for _, item := range tree {
+		if item.Type == "blob" {
+			remotePaths[item.Path] = struct{}{}
+		}
+	}
+
+	// Remove local files (and stale meta entries) that no longer exist remotely
+	for cachedPath := range meta.Files {
+		if _, existsRemotely := remotePaths[cachedPath]; !existsRemotely {
+			localPath := filepath.Join(cDir, filepath.FromSlash(cachedPath))
+			if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+				fmt.Printf("  ⚠️  Could not remove %s: %v\n", cachedPath, err)
+			} else {
+				if verbose {
+					fmt.Printf("  🗑️  Removed: %s\n", cachedPath)
+				}
+				removed++
+			}
+			delete(meta.Files, cachedPath)
+		}
+	}
+
+	// Download new or changed files
 	for _, item := range tree {
 		if item.Type != "blob" {
 			continue
@@ -372,14 +397,37 @@ func syncCache(templateName string, repoName string, token string, verbose bool)
 		meta.Files[item.Path] = &FileMeta{SHA: item.SHA}
 	}
 
+	// Prune empty directories left behind by removals
+	if removed > 0 {
+		pruneEmptyDirs(cDir)
+	}
+
 	saveMeta(templateName, meta)
 
-	if updated+added == 0 {
+	if updated+added+removed == 0 {
 		fmt.Printf("✅ '%s' template is already up to date.\n", templateName)
 	} else {
-		fmt.Printf("✅ '%s' sync complete — %d added, %d updated.\n", templateName, added, updated)
+		fmt.Printf("✅ '%s' sync complete — %d added, %d updated, %d removed.\n", templateName, added, updated, removed)
 	}
 	return nil
+}
+
+// pruneEmptyDirs removes empty subdirectories under root (bottom-up).
+func pruneEmptyDirs(root string) {
+	var dirs []string
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() && path != root {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	// Iterate in reverse so children are removed before parents
+	for i := len(dirs) - 1; i >= 0; i-- {
+		entries, err := os.ReadDir(dirs[i])
+		if err == nil && len(entries) == 0 {
+			_ = os.Remove(dirs[i])
+		}
+	}
 }
 
 func ensureCacheExists(templateName string, repoName string, token string) error {
